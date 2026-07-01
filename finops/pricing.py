@@ -5,6 +5,22 @@ live prices as fast-moving (re-baseline before each cohort).
 """
 from __future__ import annotations
 
+# Per-GPU interruption rates for spot instances (illustrative 2026).
+# H100 spot is more stable; A10G/L4 are more volatile.
+PER_GPU_INTERRUPT_RATE = {
+    "H100": 0.05,
+    "H200": 0.04,
+    "A100": 0.06,
+    "A10G": 0.12,
+    "L4": 0.15,
+    "B200": 0.03,
+    "MI300X": 0.08,
+}
+
+# Reserved discounts by term (vs on-demand).
+RESERVED_DISCOUNT_1YR = 0.25   # ~25% off
+RESERVED_DISCOUNT_3YR = 0.45   # ~45% off
+
 
 def request_cost(
     input_tok: int,
@@ -60,21 +76,68 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def recommend_tier(hours_per_day: float, interruptible: bool,
+                   reserved_discount: float = 0.45,
+                   gpu_type: str | None = None,
+                   job_days: int | None = None) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
     DOCUMENTED simple policy (instructor extension point — swap in your own):
       - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
       - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
       - otherwise                 -> 'on_demand' (spiky / low duty)
+
+    Extension 1 improvements:
+      - Checks per-GPU interruption rate: skip spot if rate > 10%.
+      - Compares 1yr vs 3yr reserved based on job_days.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
+
+    # Check per-GPU interruption rate
     if interruptible and hours_per_day < 24:
-        return "spot"
+        interrupt_rate = PER_GPU_INTERRUPT_RATE.get(gpu_type, 0.10)
+        if interrupt_rate <= 0.10:
+            return "spot"
+        # High interruption rate: consider on-demand instead of spot
+        # Still might go reserved if duty is high enough
+
     if duty >= be:
+        # If job_days is provided, distinguish 1yr vs 3yr reserved
+        if job_days is not None and job_days < 365:
+            be_1yr = break_even_utilization(RESERVED_DISCOUNT_1YR)
+            if duty >= be_1yr:
+                return "reserved_1yr"
+            return "on_demand"
+        elif job_days is not None:
+            return "reserved_3yr"
+        # Backward compatible: when job_days not provided, return "reserved"
         return "reserved"
     return "on_demand"
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    avg_cached_tokens_per_request: float = 1000.0,
+) -> tuple[bool, float]:
+    """Determine if prompt caching is worth the write cost.
+
+    Cache pays off when the total savings from reads exceeds the upfront write cost.
+    Break-even: savings_per_read * reads > write_cost
+
+    Returns (is_worth_it, break_even_reads).
+    """
+    # Cost to write (store) cache: write_cost_per_m per million tokens written
+    write_cost = (avg_cached_tokens_per_request / 1e6) * write_cost_per_m
+    # Savings per read: (1 - read_discount) * price of uncached input
+    # read_discount=0.10 means we pay 10% of original = 90% saved
+    savings_per_read = (avg_cached_tokens_per_request / 1e6) * write_cost_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return False, float("inf")
+    break_even = write_cost / savings_per_read
+    return avg_cache_reads >= break_even, break_even
 
 
 def spot_checkpoint_cost(
